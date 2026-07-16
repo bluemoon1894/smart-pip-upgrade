@@ -14,16 +14,11 @@ Design:
 Usage:
     python update_outdated_top_level.py              # analyze + upgrade + fix
     python update_outdated_top_level.py --dry-run    # analyze only
-
-Future Enhancement:
-- When latest violates constraints, query PyPI for all versions and find the
-  highest version that satisfies dependents' constraints. Low priority: most
-  dependents use == pinning, so intermediate versions rarely help; adds ~15-50s
-  for 26 extra PyPI requests.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import shutil
@@ -64,19 +59,32 @@ def site_packages_dir() -> Path:
 
 
 def cleanup_invalid_dists() -> list[Path]:
-    """Clean up pip leftover directories (tilde-prefixed). Returns removed list."""
-    site = site_packages_dir()
+    """Clean up pip leftover directories (tilde-prefixed) from all site-packages dirs.
+
+    Returns the list of removed paths.
+    """
+    import site
+
+    site_dirs: set[Path] = {site_packages_dir()}
+    with contextlib.suppress(Exception):
+        site_dirs.update(Path(d) for d in site.getsitepackages())
+    with contextlib.suppress(Exception):
+        site_dirs.add(Path(site.getusersitepackages()))
+
     removed: list[Path] = []
-    for entry in site.iterdir():
-        if entry.name.startswith("~"):
-            try:
-                if entry.is_dir():
-                    shutil.rmtree(entry)
-                else:
-                    entry.unlink()
-                removed.append(entry)
-            except OSError as e:
-                print(f"[!] Cannot cleanup {entry}: {e}", file=sys.stderr)
+    for site_dir in site_dirs:
+        if not site_dir.is_dir():
+            continue
+        for entry in site_dir.iterdir():
+            if entry.name.startswith("~"):
+                try:
+                    if entry.is_dir():
+                        shutil.rmtree(entry)
+                    else:
+                        entry.unlink()
+                    removed.append(entry)
+                except OSError as e:
+                    print(f"[!] Cannot cleanup {entry}: {e}", file=sys.stderr)
     return removed
 
 
@@ -86,7 +94,8 @@ def get_outdated_packages() -> dict[str, tuple[str, str]]:
     if result.returncode != 0:
         raise PkgError(f"pip list --outdated failed: {result.stderr}")
     outdated = {
-        p["name"].lower().replace("_", "-"): (p["version"], p["latest_version"]) for p in json.loads(result.stdout)
+        p["name"].lower().replace("_", "-"): (p["version"], p["latest_version"])
+        for p in json.loads(result.stdout)
     }
     print(f" Found {len(outdated)}")
     return outdated
@@ -104,80 +113,6 @@ def satisfies_constraint(version: str, constraint: str) -> bool:
         return True
 
 
-def check_new_version_deps(
-    pkg: str,
-    latest: str,
-    installed_versions: dict[str, str],
-    reverse_deps: dict[str, list[str]],
-    dep_specs: dict[str, dict[str, str]],
-    outdated: dict[str, tuple[str, str]],
-) -> tuple[bool, str]:
-    """Check if target version's new deps conflict with current environment.
-
-    Fetches requires_dist from PyPI for the target version and verifies
-    each required dependency is satisfied by installed packages.
-
-    Returns (ok, reason)
-    """
-    import urllib.request as ureq
-
-    url = f"https://pypi.org/pypi/{pkg}/{latest}/json"
-    try:
-        with ureq.urlopen(url, timeout=15) as resp:
-            data = json.load(resp)
-    except Exception:
-        return True, ""  # fetch failed — assume safe (conservative)
-
-    requires_dist = data.get("info", {}).get("requires_dist")
-    if not requires_dist:
-        return True, "no new deps in target"
-
-    from packaging.requirements import Requirement
-
-    problematic: list[str] = []
-    for req_str in requires_dist:
-        if not req_str:
-            continue
-        try:
-            req = Requirement(req_str)
-        except Exception:
-            continue
-        # Skip optional dependencies (extra markers)
-        if req.marker:
-            # packaging.Marker has no public markers iterator; use string form
-            if re.search(r"\bextra\b", str(req.marker)):
-                continue
-            # Skip non-matching platform markers
-            if not req.marker.evaluate():
-                continue
-
-        dep_name = req.name.lower().replace("_", "-")
-        installed_ver = installed_versions.get(dep_name)
-        # Brand-new dep not currently installed
-        if installed_ver is None:
-            problematic.append(f"{dep_name} (missing)")
-            continue
-
-        # Check if installed version satisfies the constraint
-        spec_str = str(req.specifier) if req.specifier else ""
-        if spec_str and not satisfies_constraint(installed_ver, spec_str):
-            # Check if upgrading this dep is possible
-            dep_info = outdated.get(dep_name)
-            if dep_info:
-                dep_latest = dep_info[1]
-                if satisfies_constraint(dep_latest, spec_str):
-                    # Check if upgrading this dep is safe
-                    safe, _ = can_upgrade_safely(dep_name, dep_latest, reverse_deps, dep_specs)
-                    if safe:
-                        continue
-            problematic.append(f"{dep_name} (installed {installed_ver} fails {dep_name}{spec_str})")
-
-    if problematic:
-        return False, f"new version deps conflict: {'; '.join(problematic)}"
-
-    return True, "all new deps satisfied"
-
-
 def parse_version_spec(spec: str) -> list[tuple[str, str]]:
     """Parse version constraint string. Returns [(operator, version), ...]."""
     specs = []
@@ -189,7 +124,7 @@ def parse_version_spec(spec: str) -> list[tuple[str, str]]:
     return specs
 
 
-def compute_version_intersection(all_specs: list[str]) -> str:
+def compute_version_intersection(all_specs: list[str]) -> str:  # noqa: C901
     """Compute intersection of version constraints. Returns 'CONFLICT' if unsolvable."""
     from packaging.version import Version
 
@@ -247,33 +182,90 @@ def compute_version_intersection(all_specs: list[str]) -> str:
         return "any"
 
 
-def get_installed_versions() -> dict[str, str]:
-    """Get all installed package versions."""
-    result = run_pip("list", "--format=json")
-    if result.returncode != 0:
-        return {}
-    return {p["name"].lower().replace("_", "-"): p["version"] for p in json.loads(result.stdout)}
+def batch_install(packages: list[str]) -> tuple[list[str], list[str]]:
+    """Install all packages in one batch via pip resolver.
+
+    If the batch fails because a Windows executable is locked (WinError 5),
+    identify the offending package, remove it from the batch, and retry.
+    Remaining locked packages are retried individually.
+
+    If the batch fails for a genuine conflict, fall back to individual installs.
+
+    Returns (succeeded, failed).
+    """
+    if not packages:
+        return [], []
+
+    print(f"[*] Batch installing {len(packages)} packages via pip resolver...")
+    remaining = list(packages)
+    succeeded: list[str] = []
+    locked_packages: list[str] = []
+
+    while remaining:
+        result = install(*remaining)
+        if result.returncode == 0:
+            print(f"    [OK] batch install succeeded ({len(remaining)} packages)")
+            succeeded.extend(remaining)
+            break
+
+        if "WinError 5" not in result.stderr and "拒绝访问" not in result.stderr:
+            print(f"    [!] Batch install failed: {result.stderr.strip()[:200]}")
+            print("[*] Falling back to individual install...")
+            s2, f2 = parallel_install(remaining)
+            succeeded.extend(s2)
+            locked_packages.extend(f2)
+            break
+
+        locked = identify_locked_packages(result.stderr, remaining)
+        if not locked:
+            print(
+                "    [!] Could not identify locked package; falling back to individual install..."
+            )
+            s2, f2 = parallel_install(remaining)
+            succeeded.extend(s2)
+            locked_packages.extend(f2)
+            break
+
+        remaining = [p for p in remaining if p not in locked]
+        locked_packages.extend(locked)
+        print(
+            f"    [!] Windows lock on {locked[0]}.exe; excluded {', '.join(locked)} from batch, "
+            f"retrying with {len(remaining)}"
+        )
+
+    if locked_packages:
+        print(f"[*] Retrying locked packages individually: {locked_packages}")
+        s2, f2 = parallel_install(locked_packages)
+        succeeded.extend(s2)
+        failed = f2
+    else:
+        failed = []
+
+    return succeeded, failed
 
 
 def parallel_install(packages: list[str], max_workers: int = 4) -> tuple[list[str], list[str]]:
     """Install packages in parallel. Returns (succeeded, failed)."""
     succeeded: list[str] = []
     failed: list[str] = []
+    total = len(packages)
+    completed = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(install, pkg): pkg for pkg in packages}
         for future in as_completed(futures):
             pkg = futures[future]
+            completed += 1
             try:
                 result = future.result()
                 if result.returncode == 0:
-                    print(f"    [OK] {pkg}")
+                    print(f"    [{completed}/{total}] [OK] {pkg}")
                     succeeded.append(pkg)
                 else:
-                    print(f"    [!] {pkg}: {result.stderr.strip()[:80]}")
+                    print(f"    [{completed}/{total}] [!] {pkg}: {result.stderr.strip()[:80]}")
                     failed.append(pkg)
             except Exception as e:
-                print(f"    [!] {pkg} error: {e}")
+                print(f"    [{completed}/{total}] [!] {pkg} error: {e}")
                 failed.append(pkg)
 
     return succeeded, failed
@@ -293,8 +285,6 @@ def kill_processes_by_name(name: str) -> int:
     for line in result.stdout.splitlines()[1:]:
         parts = line.split('","')
         if len(parts) >= 2 and exe.lower() in parts[0].lower():
-            import contextlib
-
             with contextlib.suppress(ValueError):
                 pids.append(int(parts[1]))
     for pid in pids:
@@ -303,15 +293,55 @@ def kill_processes_by_name(name: str) -> int:
     return count
 
 
+def extract_locked_exe_name(stderr: str) -> str | None:
+    """从 pip 的 WinError 5 报错中提取被锁定的 .exe 名称（不含扩展名）。"""
+    for token in re.findall(r"\S+\.exe", stderr, re.IGNORECASE):
+        token = token.strip("'\"").lower()
+        if "scripts" in token:
+            return Path(token).stem
+    return None
+
+
+def get_package_scripts(pkg: str) -> set[str]:
+    """获取某个已安装包提供的 console_scripts 名称集合。"""
+    try:
+        import importlib.metadata as imd
+
+        dist = imd.distribution(pkg)
+        eps = dist.entry_points
+        if hasattr(eps, "select"):
+            return {ep.name for ep in eps.select(group="console_scripts")}
+        return {ep.name for ep in eps if getattr(ep, "group", None) == "console_scripts"}
+    except Exception:
+        return set()
+
+
+def identify_locked_packages(stderr: str, candidates: list[str]) -> list[str]:
+    """根据 WinError 5 的 .exe 路径，找出 candidates 中可能是罪魁祸首的包。"""
+    exe = extract_locked_exe_name(stderr)
+    if not exe:
+        return []
+    for pkg in candidates:
+        if pkg.lower() == exe:
+            return [pkg]
+    for pkg in candidates:
+        if exe in get_package_scripts(pkg):
+            return [pkg]
+    return []
+
+
 def install(*pkg_specs: str) -> subprocess.CompletedProcess[str]:
     """Install/upgrade/downgrade packages with process-kill retry on Windows."""
     result = run_pip("install", "-U", *pkg_specs)
     if result.returncode != 0 and ("WinError 5" in result.stderr or "拒绝访问" in result.stderr):
+        exe = extract_locked_exe_name(result.stderr)
         pkg_name = pkg_specs[0].split("==")[0].split(">=")[0].split("<=")[0].strip()
-        killed = kill_processes_by_name(pkg_name)
-        if killed:
-            print(f"[*] Killed {killed} {pkg_name} process(es), retrying")
-            result = run_pip("install", "-U", *pkg_specs)
+        kill_name = exe if exe else pkg_name
+        if kill_name:
+            killed = kill_processes_by_name(kill_name)
+            if killed:
+                print(f"[*] Killed {killed} {kill_name} process(es), retrying")
+                result = run_pip("install", "-U", *pkg_specs)
     return result
 
 
@@ -421,7 +451,7 @@ def can_upgrade_safely(
     return True, f"all constraints met: {', '.join(all_specs)}"
 
 
-def analyze_shared_dep_intersection(
+def analyze_shared_dep_intersection(  # noqa: C901
     to_upgrade: list[str],
     top_level: set[str],
     outdated: dict[str, tuple[str, str]],
@@ -478,6 +508,22 @@ def analyze_shared_dep_intersection(
     return blocked_pkgs, intersections, conflicts
 
 
+# Script dependencies (non-stdlib) that must be present before running
+SCRIPT_DEPS = ["packaging", "pipdeptree"]
+
+
+def ensure_dependencies() -> None:
+    """Ensure this script's own dependencies are installed; auto-install if missing."""
+    for dep in SCRIPT_DEPS:
+        try:
+            __import__(dep)
+        except ImportError:
+            print(f"[*] {dep} not found, installing...")
+            result = run_pip("install", dep)
+            if result.returncode != 0:
+                raise PkgError(f"Failed to install {dep}: {result.stderr}") from None
+
+
 def build_dep_constraints_from_pipdeptree() -> tuple[
     dict[str, list[str]], dict[str, dict[str, str]]
 ]:
@@ -500,7 +546,7 @@ def build_dep_constraints_from_pipdeptree() -> tuple[
     )
     if result.returncode != 0:
         print(" FAILED")
-        return {}, {}
+        raise PkgError(f"pipdeptree failed: {result.stderr}")
 
     tree = json.loads(result.stdout)
     reverse_deps: dict[str, list[str]] = {}
@@ -527,8 +573,19 @@ def build_dep_constraints_from_pipdeptree() -> tuple[
 
 
 def main() -> int:
+    try:
+        return _main_impl()
+    except PkgError as e:
+        print(f"[!] Error: {e}", file=sys.stderr)
+        return 1
+
+
+def _main_impl() -> int:  # noqa: C901
     args = parse_args()
     dry_run = args["dry_run"]
+
+    # 0) Ensure this script's own dependencies are available first
+    ensure_dependencies()
 
     # 1) 清理残留
     removed = cleanup_invalid_dists()
@@ -545,17 +602,18 @@ def main() -> int:
         return 0 if check["ok"] else 1
 
     # 3) 构建依赖关系图（从 pipdeptree 直接提取约束，无需查 PyPI）
+    #    build_dep_constraints_from_pipdeptree() raises PkgError on failure so
+    #    step 4 cannot proceed with invalid/empty dep data.
     reverse_deps, dep_specs = build_dep_constraints_from_pipdeptree()
 
-    # 4) 中庸策略：逐个检查所有过时包
-    print("[3/4] Analyzing upgradability...", flush=True)
+    # 4) 中庸策略：逐个检查所有过时包（仅本地依赖约束，不查 PyPI）
+    print("[3/4] Analyzing upgradability... (local constraints, please wait)", flush=True)
     to_upgrade: list[str] = []
     skipped_unsafe: list[str] = []
 
-    # 获取已安装版本用于 PyPI 依赖验证
-    installed_versions = get_installed_versions()
-
-    for pkg in sorted(outdated.keys()):
+    total_outdated = len(outdated)
+    for idx, pkg in enumerate(sorted(outdated.keys()), 1):
+        print(f"[3/4] Analyzing {pkg} ({idx}/{total_outdated})...", end="\r", flush=True)
         current, latest = outdated[pkg]
         can_upgrade, reason = can_upgrade_safely(
             pkg,
@@ -564,17 +622,11 @@ def main() -> int:
             dep_specs,
         )
         if can_upgrade:
-            # 额外验证：检查目标版本的新依赖是否冲突
-            deps_ok, deps_reason = check_new_version_deps(
-                pkg, latest, installed_versions,
-                reverse_deps, dep_specs, outdated,
-            )
-            if deps_ok:
-                to_upgrade.append(pkg)
-            else:
-                skipped_unsafe.append(f"{pkg} ({current} -> {latest}: {deps_reason})")
+            to_upgrade.append(pkg)
         else:
             skipped_unsafe.append(f"{pkg} ({current} -> {latest}: {reason})")
+
+    print(f"[3/4] Analyzing upgradability: completed {total_outdated} packages{' ' * 10}")
 
     print(f"\n{'=' * 50}")
     print(f"Done: {len(to_upgrade)} safe, {len(skipped_unsafe)} skipped")
@@ -625,7 +677,10 @@ def main() -> int:
     # 移除被 blocked 的包
     if blocked_pkgs:
         to_upgrade = [p for p in to_upgrade if p not in blocked_pkgs]
-        print(f"\nRemoved {len(blocked_pkgs)} (shared dep conflicts): {', '.join(sorted(blocked_pkgs))}")
+        print(
+            f"\nRemoved {len(blocked_pkgs)} (shared dep conflicts): "
+            f"{', '.join(sorted(blocked_pkgs))}"
+        )
 
     # 检测到矛盾：交互模式
     if conflicts:
@@ -656,11 +711,21 @@ def main() -> int:
 
     # 6) Upgrade safe packages
     print(f"\n[4/4] Upgrading {len(to_upgrade)} packages...")
-    succeeded, failed = parallel_install(to_upgrade)
+    succeeded, failed = batch_install(to_upgrade)
+
+    removed = cleanup_invalid_dists()
+    if removed:
+        print(f"Cleaned up install leftovers: {', '.join(p.name for p in removed)}")
 
     # 7) 循环 pip check + 修复（最多 3 轮）
     max_rounds = 3
     for round_num in range(1, max_rounds + 1):
+        removed = cleanup_invalid_dists()
+        if removed:
+            print(
+                f"Cleaned up before pip check round {round_num}: "
+                f"{', '.join(p.name for p in removed)}"
+            )
         print(f"\npip check (round {round_num})...")
         check = try_resolve_conflicts(True)
         print(check["output"])
