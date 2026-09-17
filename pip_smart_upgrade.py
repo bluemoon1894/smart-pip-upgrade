@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
-"""Upgrade outdated packages with dependency conflict resolution.
+"""Upgrade outdated top-level packages with dependency conflict resolution.
 
+- Version checks target only top-level packages (pipdeptree graph roots) by
+  default, or explicit names passed on the CLI -- far cheaper than
+  `pip list --outdated`, which queries every installed package.
 - Constraints read locally from pipdeptree (no PyPI queries).
-- Top-level packages always upgrade; others only if latest meets all
-  dependents' constraints (including non-outdated pinners, e.g. kimi-cli).
 - Pre-flight: `pip install --dry-run --report <tempfile>` resolves the whole
   batch and is checked against every installed package's requirements, closing
   the hole where pip ignores already-installed pinners; unsafe targets pruned.
   (Report goes to a temp file, not "-": pip 26 renders stdout reports via rich,
   which crashes on non-GBK chars under a legacy Windows console.)
 - Shared-dep conflicts blocked or confirmed interactively.
-- Batch pip install; Windows locks (WinError 5) killed/retried individually.
+- Batch pip install; output streams live with elapsed tags, per-package noise
+  (Collecting/Downloading/Uninstalling) folded into a ~3s ticker that names the
+  packages and phase, unless `--verbose`; Windows locks (WinError 5) killed/
+  retried individually.
 - Post-upgrade: pip check + auto-fix, max 3 rounds.
+- `~*` leftover cleanup is skipped while another pip upgrade is running (its
+  in-flight staging dirs would otherwise be deleted mid-install).
+- Terse by default: the plan line shows versions (`pkg old -> new`), and
+  skip/conflict lines are compacted; `--verbose`/`-v` expands the full
+  per-package and per-constraint detail. Every long step shows live progress
+  (counters or an elapsed timer), so nothing looks hung.
 
 Usage:
-    python pip_smart_upgrade.py              # analyze + pre-flight + upgrade + fix
-    python pip_smart_upgrade.py --dry-run    # analyze + pre-flight, no install
+    python pip_smart_upgrade.py                 # top-level: analyze + pre-flight + upgrade + fix
+    python pip_smart_upgrade.py --dry-run       # analyze + pre-flight, no install
+    python pip_smart_upgrade.py -v              # verbose: full per-package / constraint dump
+    python pip_smart_upgrade.py requests rich   # only the named packages
 """
 
 from __future__ import annotations
@@ -28,6 +40,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -56,6 +70,246 @@ def run_pip(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+_PIP_NOISE_RE = re.compile(
+    r"^\s*(?:-{5,}|Collecting |Using cached |Downloading |Attempting uninstall: "
+    r"|Found existing installation: |Uninstalling |Successfully uninstalled "
+    r"|Requirement already satisfied: )",
+    re.I,
+)
+_PIP_KEEP_RE = re.compile(r"^\s*(?:Successfully installed\b|Installing collected packages\b)", re.I)
+_COLLECT_RE = re.compile(r"^\s*Collecting\s+(\S+)", re.I)
+_DOWNLOAD_RE = re.compile(r"^\s*Downloading\s+", re.I)
+_REMOVE_RE = re.compile(r"^\s*Attempting uninstall:\s+(\S+)", re.I)
+
+
+def _pip_line_kind(text: str) -> str:
+    """Streaming pip 日志行分类：keep（结果/里程碑）/ noise（逐包噪音）/ other。"""
+    if _PIP_KEEP_RE.match(text):
+        return "keep"
+    if _PIP_NOISE_RE.match(text):
+        return "noise"
+    return "other"
+
+
+def run_pip_streaming(
+    *args: str, indent: str = "    ", compact: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """Run pip while echoing its output live (long installs must not look hung).
+
+    stdout is printed line-by-line with an elapsed-seconds tag; stderr is drained
+    on a side thread. Both streams are still captured for later parsing.
+
+    compact=True folds the per-package noise (Collecting/Downloading/Uninstalling
+    lines) into a ~3s ticker that names the packages being processed and their
+    phase (collecting/downloading/removing), so the user always sees what is
+    happening without being flooded. Milestones ("Installing collected
+    packages", "Successfully installed") and errors/warnings stay visible; long
+    package lists are truncated to N names + "(+M more)". --verbose keeps every
+    raw pip line.
+    """
+    env = {**os.environ, "PYTHONUTF8": "1"}
+    start = time.monotonic()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pip", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+
+    def _drain(stream: Any, sink: list[str]) -> None:
+        for line in stream:
+            sink.append(line)
+
+    err_thread = threading.Thread(target=_drain, args=(proc.stderr, err_lines), daemon=True)
+    err_thread.start()
+    assert proc.stdout is not None
+    hidden = 0  # noise lines folded since the last tick
+    phase = ""  # latest activity keyword (collecting/downloading/removing)
+    new_names: list[str] = []
+    last_tick = start
+
+    def _emit_tick(now: float, force: bool = False) -> None:
+        nonlocal hidden, last_tick
+        if not compact:
+            return
+        if force:
+            if not new_names:
+                return  # keep/tail: only name a pending burst, don't repeat msgs
+        elif now - last_tick < 3.0 or not (new_names or hidden):
+            return
+        last_tick = now
+        label = phase or "working"
+        shown = new_names[:6]
+        extra = len(new_names) - len(shown)
+        if shown:
+            body = f"{label}: {', '.join(shown)}"
+            if extra:
+                body += f" ... (+{extra} more)"
+        else:
+            body = f"{label} ... ({hidden} msgs)"
+        print(
+            f"{indent}[{int(now - start):>4}s] {body} (use --verbose to expand)",
+            flush=True,
+        )
+        new_names.clear()
+        hidden = 0
+
+    for line in proc.stdout:
+        out_lines.append(line)
+        text = line.rstrip()
+        tag = f"{int(time.monotonic() - start):>4}s"
+        if not text:
+            continue
+        kind = _pip_line_kind(text)
+        if compact and kind == "noise":
+            hidden += 1
+            collect_m = _COLLECT_RE.match(text)
+            if collect_m:
+                phase = "collecting"
+                name = collect_m.group(1)
+                if name not in new_names:
+                    new_names.append(name)
+            else:
+                remove_m = _REMOVE_RE.match(text)
+                if remove_m:
+                    phase = "removing"
+                    name = remove_m.group(1)
+                    if name not in new_names:
+                        new_names.append(name)
+                elif _DOWNLOAD_RE.match(text):
+                    phase = "downloading"
+            _emit_tick(time.monotonic())
+            continue
+        if kind == "keep" and compact:
+            _emit_tick(time.monotonic(), force=True)
+            if len(text) > 160:
+                parts = text.split()
+                header_end = 3 if parts and parts[0].lower() == "installing" else 2
+                total = max(0, len(parts) - header_end)
+                shown_names: list[str] = []
+                width = 0
+                for part in parts[header_end:]:
+                    if width + len(part) + 2 > 150:
+                        break
+                    shown_names.append(part)
+                    width += len(part) + 2
+                text = (
+                    " ".join(parts[:header_end])
+                    + " "
+                    + ", ".join(shown_names)
+                    + f" ... (+{total - len(shown_names)} more)"
+                )
+        print(f"{indent}[{tag}] {text}", flush=True)
+    _emit_tick(time.monotonic(), force=True)
+    proc.wait()
+    err_thread.join(timeout=5)
+    return subprocess.CompletedProcess(
+        proc.args, proc.returncode, "".join(out_lines), "".join(err_lines)
+    )
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    return f"{seconds:.0f}s"
+
+
+def _compact(items: list[str], limit: int = 12) -> str:
+    """把列表压成 `a, b, ... (+N more)`，避免刷屏。"""
+    if len(items) <= limit:
+        return ", ".join(items)
+    return f"{', '.join(items[:limit])} (+{len(items) - limit} more)"
+
+
+def format_summary(
+    outdated: dict[str, tuple[str, str]],
+    succeeded: list[str],
+    failed: list[str],
+    skipped: list[tuple[str, str]],
+    check_ok: bool,
+) -> str:
+    """生成结果总结一句话：实际升级/失败/跳过/依赖状态。"""
+    upgraded = sorted(set(succeeded))
+    failed_pkgs = sorted(set(failed))
+    skipped_pkgs = sorted(p for p, _ in skipped)
+    bits: list[str] = []
+    if upgraded:
+        bits.append(
+            f"upgraded {len(upgraded)} "
+            f"({_compact([f'{p} {outdated[p][0]} -> {outdated[p][1]}' for p in upgraded], 6)})"
+        )
+    else:
+        bits.append("upgraded 0")
+    if failed_pkgs:
+        bits.append(f"failed {len(failed_pkgs)} ({_compact(failed_pkgs, 6)})")
+    if skipped_pkgs:
+        bits.append(
+            f"skipped {len(skipped_pkgs)} "
+            f"({_compact([f'{p} ({reason})' for p, reason in skipped if p in skipped_pkgs], 6)})"
+        )
+    bits.append("pip check clean" if check_ok else "pip check FAILED")
+    return "Summary: " + ", ".join(bits) + "."
+
+
+class Pulse:
+    """单行原地状态显示；非 TTY（重定向/管道）时退化为每次一行。"""
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+        self._tty = sys.stdout.isatty()
+        self._width = 0
+
+    def _render(self, text: str, end: str) -> None:
+        if self._tty:
+            pad = " " * max(0, self._width - len(text))
+            print(f"\r{text}{pad}", end=end, flush=True)
+            self._width = len(text)
+        else:
+            print(text, end=end, flush=True)
+            if end == "\n":
+                self._width = len(text)
+
+    def set(self, detail: str = "") -> None:
+        # 非 TTY 无法原地刷新，逐次打印只会刷屏；交给 done() 收尾输出一行即可。
+        if not self._tty:
+            return
+        self._render(f"{self._label}{detail}", "")
+
+    def done(self, detail: str = "") -> None:
+        self._render(f"{self._label}{detail}", "\n")
+
+
+class Working:
+    """上下文管理器：为不透明长调用持续刷新耗时，确保"一直在动"。"""
+
+    def __init__(self, label: str, interval: float = 3.0) -> None:
+        self._pulse = Pulse(label)
+        self._interval = interval
+        self._stop = threading.Event()
+        self._start = 0.0
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> Working:
+        self._start = time.monotonic()
+        self._pulse.set()
+        self._thread = threading.Thread(target=self._tick, daemon=True)
+        self._thread.start()
+        return self
+
+    def _tick(self) -> None:
+        while not self._stop.wait(self._interval):
+            self._pulse.set(f" {_fmt_elapsed(time.monotonic() - self._start)}")
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        self._pulse.done(f" {_fmt_elapsed(time.monotonic() - self._start)}")
+
+
 def site_packages_dir() -> Path:
     result = run_pip("show", "pip")
     for line in result.stdout.splitlines():
@@ -64,12 +318,78 @@ def site_packages_dir() -> Path:
     raise PkgError("Cannot locate site-packages directory")
 
 
+_PIP_CMD_RE = re.compile(
+    r"(?:^|\s)-m\s+pip(?:\s|$)"
+    r"|(?:^|[\\/\s\"'])pip(?:\.exe)?[\"']?\s+(?:install|uninstall|download)\b",
+    re.IGNORECASE,
+)
+
+
+def _iter_pip_cmdlines(text: str, me_pid: int) -> list[str]:
+    """从 `pid<TAB>cmdline` 文本中挑出其他 pip 进程（排除 me_pid）。
+
+    只认真正的 pip 调用（`python -m pip ...` / `pip install ...`），避免把
+    pyright/grep 等命令行里恰好出现本脚本文件名的进程误判为 pip。
+    """
+    active: list[str] = []
+    for line in text.splitlines():
+        pid_str, sep, cmd = line.partition("\t")
+        if not sep:
+            continue
+        with contextlib.suppress(ValueError):
+            if int(pid_str.strip()) == me_pid:
+                continue
+        if _PIP_CMD_RE.search(cmd):
+            active.append(cmd.strip())
+    return active
+
+
+def active_pip_processes() -> list[str]:
+    """其他正在运行的 pip / 本脚本进程的命令行（排除自身）。
+
+    `~*` 目录可能是这些进程正在做卸载/安装的在途 staging；此时清理会装坏包，
+    故清理前先探测。非 Windows 或探测失败时返回 []（不做拦截）。
+    """
+    if os.name != "nt":
+        return []
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | "
+        'ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }'
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    return _iter_pip_cmdlines(result.stdout, os.getpid())
+
+
 def cleanup_invalid_dists() -> list[Path]:
     """Clean up pip leftover directories (tilde-prefixed) from all site-packages dirs.
 
-    Returns the list of removed paths.
+    Skips entirely (with a warning) when another pip upgrade is running, since those
+    `~*` dirs may be its in-flight staging. Returns the list of removed paths.
     """
     import site
+
+    active = active_pip_processes()
+    if active:
+        print(
+            f"[!] Detected {len(active)} active pip upgrade process(es); skipping ~* cleanup "
+            "to avoid deleting in-flight staging dirs:"
+        )
+        for cmd in active[:3]:
+            print(f"      {cmd}")
+        return []
 
     site_dirs: set[Path] = {site_packages_dir()}
     with contextlib.suppress(Exception):
@@ -94,16 +414,90 @@ def cleanup_invalid_dists() -> list[Path]:
     return removed
 
 
-def get_outdated_packages() -> dict[str, tuple[str, str]]:
-    print("[1/4] Checking outdated packages (queries PyPI, may be slow)...", end="", flush=True)
-    result = run_pip("list", "--outdated", "--format=json")
+def _is_local_install(pkg: str) -> bool:
+    """是否为 editable 或从本地目录/文件安装（direct_url.json 判定）。
+
+    这类包不应被当成 PyPI 包查询/升级（如项目自身的 `netmind` 编辑安装）。
+    """
+    import importlib.metadata as imd
+
+    try:
+        raw = imd.distribution(pkg).read_text("direct_url.json")
+    except (imd.PackageNotFoundError, OSError):
+        return False
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if (data.get("dir_info") or {}).get("editable"):
+        return True
+    return str(data.get("url", "")).startswith("file:")
+
+
+def _pip_index_latest(pkg: str) -> tuple[str, str] | None:
+    """查询单个包的 INSTALLED/LATEST（`pip index versions`）。
+
+    比 `pip list --outdated` 全量扫描（对每个已装包都发请求）省得多。
+    返回 (installed, latest)；不可查、未装、或本地/editable 安装（显式判定，
+    且当前版本不在索引版本列表中，双保险防用 PyPI 同名包误判升级）则返回 None。
+    """
+    if _is_local_install(pkg):
+        return None
+    result = run_pip("index", "versions", pkg)
     if result.returncode != 0:
-        raise PkgError(f"pip list --outdated failed: {result.stderr}")
-    outdated = {
-        p["name"].lower().replace("_", "-"): (p["version"], p["latest_version"])
-        for p in json.loads(result.stdout)
-    }
-    print(f" Found {len(outdated)}")
+        return None
+    installed = latest = ""
+    available: set[str] = set()
+    for line in result.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("INSTALLED:"):
+            installed = s.split(":", 1)[1].strip()
+        elif s.startswith("LATEST:"):
+            latest = s.split(":", 1)[1].strip()
+        elif s.startswith("Available versions:"):
+            available = {v.strip() for v in s.split(":", 1)[1].split(",")}
+    if not installed or not latest:
+        return None
+    if installed not in available:
+        return None
+    return installed, latest
+
+
+def get_top_level_packages(
+    dep_specs: dict[str, dict[str, str]],
+    reverse_deps: dict[str, list[str]],
+) -> list[str]:
+    """顶层包 = 依赖图的根（无任何包依赖它），排除本地/editable 安装。"""
+    return sorted(p for p in dep_specs if not reverse_deps.get(p) and not _is_local_install(p))
+
+
+def get_outdated_packages(targets: list[str]) -> dict[str, tuple[str, str]]:
+    """返回 targets 中过时包的 {包名: (当前, 最新)}。
+
+    只对 targets（默认顶层包，或命令行显式点名）并行查索引，替代会扫描
+    每个已装包的 `pip list --outdated`。
+    """
+    outdated: dict[str, tuple[str, str]] = {}
+    total = len(targets)
+    pulse = Pulse(f"[2/4] checking {total} targets for updates...")
+    pulse.set()
+    workers = min(16, max(1, total))
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_pip_index_latest, t): t for t in targets}
+        for fut in as_completed(futures):
+            done += 1
+            with contextlib.suppress(Exception):
+                res = fut.result()
+                if res and res[0] and res[1] and res[0] != res[1]:
+                    outdated[normalize(futures[fut])] = (res[0], res[1])
+            pulse.set(f" {done}/{total}, {len(outdated)} outdated")
+    detail = ""
+    if outdated:
+        detail = f" ({_compact(sorted(outdated), 6)})"
+    pulse.done(f" {total} checked, {len(outdated)} outdated{detail}")
     return outdated
 
 
@@ -217,7 +611,7 @@ def specifier_conflicts(all_specs: list[str]) -> tuple[bool, str]:
     return False, ""
 
 
-def batch_install(packages: list[str]) -> tuple[list[str], list[str]]:
+def batch_install(packages: list[str], *, compact: bool = True) -> tuple[list[str], list[str]]:
     """Install all packages in one batch via pip resolver.
 
     If the batch fails because a Windows executable is locked (WinError 5),
@@ -232,19 +626,24 @@ def batch_install(packages: list[str]) -> tuple[list[str], list[str]]:
         return [], []
 
     print(f"[*] Batch installing {len(packages)} packages via pip resolver...")
+    print("    (pip output streams below with elapsed seconds -- this is the slow step)")
     remaining = list(packages)
     succeeded: list[str] = []
     locked_packages: list[str] = []
 
     while remaining:
-        result = install(*remaining)
+        start = time.monotonic()
+        result = install(*remaining, stream=True, compact=compact)
+        elapsed = time.monotonic() - start
         if result.returncode == 0:
-            print(f"    [OK] batch install succeeded ({len(remaining)} packages)")
+            print(f"    [OK] batch install succeeded ({len(remaining)} packages, {elapsed:.0f}s)")
             succeeded.extend(remaining)
             break
 
         if "WinError 5" not in result.stderr and "拒绝访问" not in result.stderr:
-            print(f"    [!] Batch install failed: {result.stderr.strip()[:200]}")
+            print(
+                f"    [!] Batch install failed after {elapsed:.0f}s: {result.stderr.strip()[:200]}"
+            )
             print("[*] Falling back to individual install...")
             s2, f2 = parallel_install(remaining)
             succeeded.extend(s2)
@@ -285,6 +684,7 @@ def parallel_install(packages: list[str], max_workers: int = 4) -> tuple[list[st
     failed: list[str] = []
     total = len(packages)
     completed = 0
+    print(f"[*] Installing {total} package(s) individually (up to {max_workers} in parallel)...")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(install, pkg): pkg for pkg in packages}
@@ -367,9 +767,25 @@ def identify_locked_packages(stderr: str, candidates: list[str]) -> list[str]:
     return []
 
 
-def install(*pkg_specs: str) -> subprocess.CompletedProcess[str]:
-    """Install/upgrade/downgrade packages with process-kill retry on Windows."""
-    result = run_pip("install", "-U", *pkg_specs)
+def install(
+    *pkg_specs: str, stream: bool = False, compact: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """Install/upgrade/downgrade packages with process-kill retry on Windows.
+
+    stream=True echoes pip output live (used for the long batch attempt);
+    compact=True collapses the per-package noise while keeping errors and the
+    final result line.
+    """
+    if stream:
+
+        def runner(*inner_args: str) -> subprocess.CompletedProcess[str]:
+            return run_pip_streaming(*inner_args, compact=compact)
+    else:
+
+        def runner(*inner_args: str) -> subprocess.CompletedProcess[str]:
+            return run_pip(*inner_args)
+
+    result = runner("install", "-U", *pkg_specs)
     if result.returncode != 0 and ("WinError 5" in result.stderr or "拒绝访问" in result.stderr):
         exe = extract_locked_exe_name(result.stderr)
         pkg_name = pkg_specs[0].split("==")[0].split(">=")[0].split("<=")[0].strip()
@@ -378,7 +794,7 @@ def install(*pkg_specs: str) -> subprocess.CompletedProcess[str]:
             killed = kill_processes_by_name(kill_name)
             if killed:
                 print(f"[*] Killed {killed} {kill_name} process(es), retrying")
-                result = run_pip("install", "-U", *pkg_specs)
+                result = runner("install", "-U", *pkg_specs)
     return result
 
 
@@ -626,10 +1042,12 @@ def report_remaining_conflicts(check: dict[str, Any]) -> None:
         print("Unrecognized conflicts; inspect pip check output above.")
 
 
-def parse_args() -> dict[str, bool]:
-    """Parse CLI args. Only --dry-run."""
+def parse_args() -> dict[str, Any]:
+    """Parse CLI args: --dry-run, --verbose/-v, plus optional explicit package names."""
     return {
         "dry_run": "--dry-run" in sys.argv,
+        "verbose": "--verbose" in sys.argv or "-v" in sys.argv,
+        "packages": [a for a in sys.argv[1:] if not a.startswith("-")],
     }
 
 
@@ -653,22 +1071,22 @@ def can_upgrade_safely(
         return True, "top-level, no dependents"
 
     # Collect all dependents' version constraints on this package
-    all_specs: list[str] = []
+    all_specs: list[tuple[str, str]] = []
     for depender in dependers:
         spec = dep_specs.get(depender, {}).get(pkg, "")
         if spec:
-            all_specs.append(spec)
+            all_specs.append((depender, spec))
 
     # No constraints = safe to upgrade
     if not all_specs:
         return True, "dependents unconstrained"
 
     # Check if latest satisfies each constraint individually
-    for spec in all_specs:
+    for depender, spec in all_specs:
         if not satisfies_constraint(latest, spec):
-            return False, f"latest {latest} violates constraint {spec}"
+            return False, f"{depender} needs {spec}"
 
-    return True, f"all constraints met: {', '.join(all_specs)}"
+    return True, f"all constraints met: {', '.join(s for _, s in all_specs)}"
 
 
 def analyze_shared_dep_intersection(
@@ -766,7 +1184,6 @@ def build_dep_constraints_from_pipdeptree() -> tuple[
     """
     import subprocess as sp
 
-    print("[2/4] Building dep graph...", end="", flush=True)
     result = sp.run(
         [sys.executable, "-m", "pipdeptree", "--json-tree", "--warn", "silence"],
         capture_output=True,
@@ -776,7 +1193,6 @@ def build_dep_constraints_from_pipdeptree() -> tuple[
         check=False,
     )
     if result.returncode != 0:
-        print(" FAILED")
         raise PkgError(f"pipdeptree failed: {result.stderr}")
 
     tree = json.loads(result.stdout)
@@ -799,7 +1215,6 @@ def build_dep_constraints_from_pipdeptree() -> tuple[
     for item in tree:
         process_item(item)
 
-    print(" done")
     return reverse_deps, dep_specs
 
 
@@ -814,17 +1229,40 @@ def main() -> int:
 def _main_impl() -> int:
     args = parse_args()
     dry_run = args["dry_run"]
+    verbose = args["verbose"]
+    explicit = args["packages"]
 
     # 0) Ensure this script's own dependencies are available first
     ensure_dependencies()
 
-    # 1) 清理残留
+    # 清理残留
     removed = cleanup_invalid_dists()
     if removed:
         print(f"Cleaned up: {', '.join(p.name for p in removed)}")
 
-    # 2) 获取过时包
-    outdated = get_outdated_packages()
+    # 1) 构建依赖关系图（从 pipdeptree 直接提取约束，本地，不查 PyPI）
+    #    build_dep_constraints_from_pipdeptree() raises PkgError on failure so
+    #    later steps cannot proceed with invalid/empty dep data.
+    graph_start = time.monotonic()
+    graph_pulse = Pulse("[1/4] building dep graph...")
+    graph_pulse.set()
+    reverse_deps, dep_specs = build_dep_constraints_from_pipdeptree()
+
+    # 2) 只对顶层包（或命令行显式点名的包）查版本；
+    #    替代会扫描每个已装包的 `pip list --outdated`
+    if explicit:
+        targets = [normalize(p) for p in explicit]
+        targets_label = f"{len(targets)} targeted"
+    else:
+        targets = get_top_level_packages(dep_specs, reverse_deps)
+        targets_label = f"{len(targets)} top-level"
+        if not targets:
+            raise PkgError("pipdeptree graph yielded no top-level packages")
+    graph_pulse.done(
+        f" {len(dep_specs)} installed, {targets_label} "
+        f"({_fmt_elapsed(time.monotonic() - graph_start)})"
+    )
+    outdated = get_outdated_packages(targets)
 
     if not outdated:
         print("All packages up to date")
@@ -832,19 +1270,13 @@ def _main_impl() -> int:
         report_remaining_conflicts(check)
         return 0 if check["ok"] else 1
 
-    # 3) 构建依赖关系图（从 pipdeptree 直接提取约束，无需查 PyPI）
-    #    build_dep_constraints_from_pipdeptree() raises PkgError on failure so
-    #    step 4 cannot proceed with invalid/empty dep data.
-    reverse_deps, dep_specs = build_dep_constraints_from_pipdeptree()
-
     # 4) 中庸策略：逐个检查所有过时包（仅本地依赖约束，不查 PyPI）
-    print("[3/4] Analyzing upgradability... (local constraints, please wait)", flush=True)
     to_upgrade: list[str] = []
-    skipped_unsafe: list[str] = []
-
+    skipped: list[tuple[str, str]] = []
     total_outdated = len(outdated)
+    analyze_pulse = Pulse(f"[3/4] analyzing upgradability ({total_outdated} packages)...")
+    analyze_pulse.set()
     for idx, pkg in enumerate(sorted(outdated.keys()), 1):
-        print(f"[3/4] Analyzing {pkg} ({idx}/{total_outdated})...", end="\r", flush=True)
         current, latest = outdated[pkg]
         can_upgrade, reason = can_upgrade_safely(
             pkg,
@@ -855,23 +1287,33 @@ def _main_impl() -> int:
         if can_upgrade:
             to_upgrade.append(pkg)
         else:
-            skipped_unsafe.append(f"{pkg} ({current} -> {latest}: {reason})")
-
-    print(f"[3/4] Analyzing upgradability: completed {total_outdated} packages{' ' * 10}")
-
-    print(f"\n{'=' * 50}")
-    print(f"Done: {len(to_upgrade)} safe, {len(skipped_unsafe)} skipped")
+            skipped.append((pkg, reason))
+        analyze_pulse.set(f" {idx}/{total_outdated}")
+    analyze_pulse.done(
+        f" {total_outdated} analyzed -> {len(to_upgrade)} safe, {len(skipped)} skipped"
+    )
 
     if to_upgrade:
-        print("\nSafe to upgrade:")
-        for pkg in to_upgrade:
-            current, latest = outdated[pkg]
-            print(f"    {pkg}: {current} -> {latest}")
+        if verbose:
+            print("\nPlan (safe to upgrade):")
+            for pkg in sorted(to_upgrade):
+                current, latest = outdated[pkg]
+                print(f"    {pkg}: {current} -> {latest}")
+        else:
+            plan_items = [f"{p} {outdated[p][0]} -> {outdated[p][1]}" for p in sorted(to_upgrade)]
+            print(f"Plan ({len(to_upgrade)}): {_compact(plan_items, 10)}")
 
-    if skipped_unsafe:
-        print("\nSkipped (dependents pinning):")
-        for item in skipped_unsafe:
-            print(f"    {item}")
+    if skipped:
+        if verbose:
+            print("\nSkipped (dependents pinning):")
+            for pkg, reason in skipped:
+                current, latest = outdated[pkg]
+                print(f"    {pkg}: {current} -> {latest}: {reason}")
+        else:
+            print(
+                f"Skipped ({len(skipped)}): "
+                f"{_compact([f'{pkg} ({reason})' for pkg, reason in skipped], 8)}"
+            )
 
     if not to_upgrade:
         print("\nNo safe upgrades available")
@@ -880,7 +1322,6 @@ def _main_impl() -> int:
         return 0 if check["ok"] else 1
 
     # 5) 分析共享依赖版本约束交集（检测矛盾）
-    print("[4/4] Analyzing shared dep conflicts...")
     blocked_pkgs, intersections, conflicts = analyze_shared_dep_intersection(
         to_upgrade,
         set(outdated.keys()),
@@ -889,8 +1330,12 @@ def _main_impl() -> int:
         dep_specs,
     )
 
-    if intersections:
-        print(f"\nFound {len(intersections)} shared deps:")
+    print(f"[4/4] shared deps: {len(intersections)} analyzed, {len(conflicts)} conflicts")
+    for dep in conflicts:
+        info = intersections.get(dep) or {}
+        print(f"    [!] {dep}: {info.get('reason') or 'conflicting constraints'}")
+
+    if verbose:
         for dep, info in sorted(intersections.items(), key=lambda x: -len(x[1]["specs"])):
             specs = info["specs"]
             intersection = info["intersection"]
@@ -905,8 +1350,6 @@ def _main_impl() -> int:
             if "outdated" in info:
                 cur, lat = info["outdated"]
                 print(f"      version: {cur} -> {lat}")
-    else:
-        print("    No shared dep conflicts")
 
     # 移除被 blocked 的包
     if blocked_pkgs:
@@ -917,8 +1360,12 @@ def _main_impl() -> int:
         )
 
     # 5.5) Pre-flight：用 pip 解析器预演整批，捕获「已装包精确锁定」被打破的情况
-    print("\n[*] Pre-flight resolver dry-run...")
-    report, err = dry_run_resolution(to_upgrade)
+    print()
+    with Working(
+        f"[*] pre-flight: resolving {len(to_upgrade)} packages via pip (no install)...",
+        2.0,
+    ):
+        report, err = dry_run_resolution(to_upgrade)
     if err:
         print(f"    [!] dry-run skipped: {err}")
     elif report is not None:
@@ -935,7 +1382,10 @@ def _main_impl() -> int:
                 break
             to_upgrade = [p for p in to_upgrade if normalize(p) not in bad]
             print(f"    [!] Pruned {len(bad)} unsafe target(s): {', '.join(sorted(bad))}")
-            report, err = dry_run_resolution(to_upgrade)
+            with Working(
+                f"    pre-flight: re-resolving pruned plan ({len(to_upgrade)} pkgs)...", 2.0
+            ):
+                report, err = dry_run_resolution(to_upgrade)
             if err or not report:
                 violations = []
                 break
@@ -978,8 +1428,10 @@ def _main_impl() -> int:
             return 0
 
     # 6) Upgrade safe packages
-    print(f"\n[4/4] Upgrading {len(to_upgrade)} packages...")
-    succeeded, failed = batch_install(to_upgrade)
+    print(f"\n[*] Upgrading {len(to_upgrade)} packages...")
+    upgrade_start = time.monotonic()
+    succeeded, failed = batch_install(to_upgrade, compact=not verbose)
+    print(f"[*] Upgrade step finished in {_fmt_elapsed(time.monotonic() - upgrade_start)}")
 
     removed = cleanup_invalid_dists()
     if removed:
@@ -1014,10 +1466,12 @@ def _main_impl() -> int:
 
     # 8) 汇总
     print("\n" + "=" * 50)
-    print(f"Upgraded: {len(succeeded)} ok, {len(failed)} failed")
-    if failed:
+    print(format_summary(outdated, succeeded, failed, skipped, check["ok"]))
+
+    failed_pkgs = sorted(set(failed))
+    if failed_pkgs:
         print("Failed:")
-        for pkg in failed:
+        for pkg in failed_pkgs:
             print(f"    - {pkg}")
     if not check["ok"]:
         print("Dependency conflicts remain, manual intervention needed")
@@ -1029,7 +1483,7 @@ def _main_impl() -> int:
         else:
             print("Inspect pip check output above.")
         return 1
-    return 1 if failed else 0
+    return 1 if failed_pkgs else 0
 
 
 if __name__ == "__main__":
