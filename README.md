@@ -34,8 +34,9 @@ truly safe.
   what was actually upgraded / failed / skipped
 - Live progress: every long step shows motion — counters while checking/analyzing, the
   batch install streams pip's output with elapsed tags (per-package
-  Collecting/Downloading/Uninstalling noise collapsed to a heart-beat unless
-  `--verbose`), and the pre-flight shows a ticking timer, so no step ever looks hung
+  Collecting/Downloading/Uninstalling noise folded into a ~3s ticker naming the
+  packages and their phase, unless `--verbose`), and the pre-flight shows a ticking
+  timer, so no step ever looks hung
 - Concurrency-safe cleanup: `~*` leftover dirs are left alone whenever another pip
   upgrade is running, so it never deletes an in-flight staging directory
 - Post-upgrade: runs `pip check` and auto-fixes issues (max 3 rounds); if conflicts
@@ -79,7 +80,8 @@ python scripts/pip_smart_upgrade.py requests ruff
    the plan against all installed packages; prune targets whose upgrade would break
    something, then re-resolve
 6. Batch install the survivors, streaming pip output with elapsed tags; per-package
-   noise is collapsed unless `--verbose` (Windows lock kill-and-retry)
+   noise is folded into a ~3s package-name/phase ticker unless `--verbose` (Windows
+   lock kill-and-retry)
 7. Run `pip check`; auto-fix remaining conflicts for up to 3 rounds, then report manual
    suggestions if anything is still broken
 
